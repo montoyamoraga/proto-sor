@@ -43,6 +43,25 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def get_with_retry(session, url, retries=4, backoff=1.5, **kwargs):
+    """GET with retries on transient network errors (dropped/reset connections,
+    timeouts, 5xx) -- these free/undocumented endpoints occasionally hiccup
+    under sustained polling."""
+    for attempt in range(retries):
+        try:
+            resp = session.get(url, **kwargs)
+            if resp.status_code >= 500:
+                raise requests.HTTPError(f"{resp.status_code} server error", response=resp)
+            resp.raise_for_status()
+            return resp
+        except requests.RequestException as e:
+            if attempt == retries - 1:
+                raise
+            wait = backoff ** attempt
+            log(f"  request to {url} failed ({e}), retrying in {wait:.1f}s...")
+            time.sleep(wait)
+
+
 # ---------------------------------------------------------------------------
 # geo helpers
 # ---------------------------------------------------------------------------
@@ -134,13 +153,13 @@ def find_panorama(lat, lon, session, radius_m=50):
         "!1m5!1sapiv3!5sUS!11m2!1m1!1b0!2m4!1m2!3d%.8f!4d%.8f!2d%d!"
         "3m10!2m2!1sen!2sUS!9m1!1e2!11m4!1m3!1e2!2b1!3e2!4m10!1e1!1e2!1e3!1e4!1e8!1e6!5m1!1e2!6m1!1e2"
     ) % (lat, lon, radius_m)
-    resp = session.get(
+    resp = get_with_retry(
+        session,
         PANO_SEARCH_URL,
         params={"pb": pb, "callback": "_xdc_._scraper"},
         headers={"User-Agent": USER_AGENT},
         timeout=15,
     )
-    resp.raise_for_status()
     text = resp.text
     try:
         data = json.loads(text[text.index("(") + 1:text.rindex(")")])
@@ -166,7 +185,8 @@ def find_panorama(lat, lon, session, radius_m=50):
 # ---------------------------------------------------------------------------
 
 def fetch_tile(pano_id, zoom, x, y, session):
-    resp = session.get(
+    resp = get_with_retry(
+        session,
         TILE_URL,
         params={
             "output": "tile",
@@ -181,7 +201,6 @@ def fetch_tile(pano_id, zoom, x, y, session):
         headers={"User-Agent": USER_AGENT},
         timeout=15,
     )
-    resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content)).convert("RGB")
 
 
@@ -278,8 +297,13 @@ def main():
             log("hit --max-frames, stopping")
             break
 
-        pano = find_panorama(lat, lon, session)
-        time.sleep(args.delay)
+        try:
+            pano = find_panorama(lat, lon, session)
+        except requests.RequestException as e:
+            log(f"[{i}] pano search failed near ({lat:.6f},{lon:.6f}): {e}, skipping")
+            continue
+        finally:
+            time.sleep(args.delay)
         if pano is None:
             log(f"[{i}] no imagery near ({lat:.6f},{lon:.6f}), skipping")
             continue
@@ -293,7 +317,7 @@ def main():
 
         try:
             equirect = fetch_panorama(pano["pano_id"], args.zoom, session, tile_delay=args.delay)
-        except requests.HTTPError as e:
+        except requests.RequestException as e:
             log(f"[{i}] failed to fetch pano {pano['pano_id']}: {e}")
             continue
 

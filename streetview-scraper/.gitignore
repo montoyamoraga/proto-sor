@@ -1,5 +1,8 @@
 venv/
 frames/
+frames_*/
 *.mp4
+*.pt
+*_labels.txt
 __pycache__/
 *.pyc
